@@ -10,7 +10,8 @@ import {
   Network,
   Transaction,
   Payment,
-  Psbt
+  Psbt,
+  initEccLib
 } from 'bitcoinjs-lib';
 import { encodingLength } from 'varuint-bitcoin';
 import type { PartialSig } from 'bip174/src/lib/interfaces';
@@ -295,6 +296,7 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
         throw new Error(`Error: could not get an address in ${descriptor}`);
       let output;
       try {
+        initEccLib(ecc); // bitcoin-js lib requires initEccLib for working with taproot scripts
         output = address.toOutputScript(matchedAddress, network);
       } catch (e) {
         throw new Error(`Error: invalid address ${matchedAddress}`);
@@ -946,7 +948,7 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
     }
 
     /**
-     * Returns the tuple: `{ isPKH: boolean; isWPKH: boolean; isSH: boolean; }`
+     * Returns the tuple: `{ isPKH: boolean; isWPKH: boolean; isSH: boolean; isTR: boolean }`
      * for this Output.
      */
     guessOutput() {
@@ -974,14 +976,22 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
           return false;
         }
       }
+      function guessTR(output: Buffer) {
+        try {
+          payments.p2tr({ output });
+          return true;
+        } catch (err) {
+          return false;
+        }
+      }
       const isPKH = guessPKH(this.getScriptPubKey());
       const isWPKH = guessWPKH(this.getScriptPubKey());
       const isSH = guessSH(this.getScriptPubKey());
-
-      if ([isPKH, isWPKH, isSH].filter(Boolean).length > 1)
+      const isTR = guessTR(this.getScriptPubKey());
+      if ([isPKH, isWPKH, isSH, isTR].filter(Boolean).length > 1)
         throw new Error('Cannot have multiple output types.');
 
-      return { isPKH, isWPKH, isSH };
+      return { isPKH, isWPKH, isSH, isTR };
     }
 
     // References for inputWeight & outputWeight:
@@ -989,6 +999,7 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
     // https://bitcoinops.org/en/tools/calc-size/
     // Look for byteLength: https://github.com/bitcoinjs/bitcoinjs-lib/blob/master/ts_src/transaction.ts
     // https://github.com/bitcoinjs/coinselect/blob/master/utils.js
+    // TR: https://bitcoin.stackexchange.com/questions/111395/what-is-the-weight-of-a-p2tr-input
 
     /**
      * Computes the Weight Unit contributions of this Output as if it were the
@@ -1024,13 +1035,14 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
       const errorMsg =
         'Input type not implemented. Currently supported: pkh(KEY), wpkh(KEY), \
     sh(wpkh(KEY)), sh(wsh(MINISCRIPT)), sh(MINISCRIPT), wsh(MINISCRIPT), \
-    addr(PKH_ADDRESS), addr(WPKH_ADDRESS), addr(SH_WPKH_ADDRESS).';
+    addr(PKH_ADDRESS), addr(WPKH_ADDRESS), addr(SH_WPKH_ADDRESS), addr(TR_ADDRESS).';
 
       //expand any miniscript-based descriptor. If not miniscript-based, then it's
       //an addr() descriptor. For those, we can only guess their type.
       const expansion = this.expand().expandedExpression;
-      const { isPKH, isWPKH, isSH } = this.guessOutput();
-      if (!expansion && !isPKH && !isWPKH && !isSH) throw new Error(errorMsg);
+      const { isPKH, isWPKH, isSH, isTR } = this.guessOutput();
+      if (!expansion && !isPKH && !isWPKH && !isSH && !isTR)
+        throw new Error(errorMsg);
 
       const firstSignature =
         signatures && typeof signatures[0] === 'object'
@@ -1061,6 +1073,18 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
           64 * 4 +
           // Segwit: (push_count:1) + (sig:73) + (pubkey:34)
           (1 + signatureSize(firstSignature) + 34)
+        );
+      } else if (expansion ? expansion.startsWith('tr(') : isTR) {
+        // P2TR keypath input case
+        // FUTURE TODO: P2TR scriptpath estimations
+        // FUTURE TODO: tr() 'expansion' realization
+        if (!isSegwitTx) throw new Error('Should be SegwitTx');
+
+        return (
+          // Non-segwit: (txid:32) + (vout:4) + (sequence:4) + (script_len:1)
+          41 * 4 +
+          // Segwit: (push_count:1) + (sig_length(1) + schnorr_sig(64): 65)
+          (1 + 65)
         );
       } else if (expansion?.startsWith('sh(wsh(')) {
         if (!isSegwitTx) throw new Error('Should be SegwitTx');
@@ -1140,13 +1164,14 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
       const errorMsg =
         'Output type not implemented. Currently supported: pkh(KEY), wpkh(KEY), \
     sh(ANYTHING), wsh(ANYTHING), addr(PKH_ADDRESS), addr(WPKH_ADDRESS), \
-    addr(SH_WPKH_ADDRESS)';
+    addr(SH_WPKH_ADDRESS), addr(TR_ADDRESS).';
 
       //expand any miniscript-based descriptor. If not miniscript-based, then it's
       //an addr() descriptor. For those, we can only guess their type.
       const expansion = this.expand().expandedExpression;
-      const { isPKH, isWPKH, isSH } = this.guessOutput();
-      if (!expansion && !isPKH && !isWPKH && !isSH) throw new Error(errorMsg);
+      const { isPKH, isWPKH, isSH, isTR } = this.guessOutput();
+      if (!expansion && !isPKH && !isWPKH && !isSH && !isTR)
+        throw new Error(errorMsg);
       if (expansion ? expansion.startsWith('pkh(') : isPKH) {
         // (p2pkh:26) + (amount:8)
         return 34 * 4;
@@ -1156,6 +1181,9 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
       } else if (expansion ? expansion.startsWith('sh(') : isSH) {
         // (p2sh:24) + (amount:8)
         return 32 * 4;
+      } else if (expansion ? expansion.startsWith('tr(') : isTR) {
+        // (script_pubKey_length:1) + (p2t2(OP_1 OP_PUSH32 <schnorr_public_key>):34) + (amount:8)
+        return 43 * 4;
       } else if (expansion?.startsWith('wsh(')) {
         // (p2wsh:35) + (amount:8)
         return 43 * 4;
@@ -1173,7 +1201,6 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
       txId?: string;
       value?: number;
       vout: number;
-      rbf?: boolean;
     }) {
       this.updatePsbtAsInput(params);
       return params.psbt.data.inputs.length - 1;
@@ -1196,14 +1223,6 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
      *
      * When unsure, always use `txHex`, and skip `txId` and `value` for safety.
      *
-     * Use `rbf` to mark whether this tx can be replaced with another with
-     * higher fee while being in the mempool. Note that a tx will automatically
-     * be marked as replacable if a single input requests it.
-     * Note that any transaction using a relative timelock (nSequence < 0x80000000)
-     * also falls within the RBF range (nSequence < 0xFFFFFFFE), making it
-     * inherently replaceable. So don't set `rbf` to false if this is tx uses
-     * relative time locks.
-     *
      * @returns A finalizer function to be used after signing the `psbt`.
      * This function ensures that this input is properly finalized.
      * The finalizer has this signature:
@@ -1216,15 +1235,13 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
       txHex,
       txId,
       value,
-      vout, //vector output index
-      rbf = true
+      vout //vector output index
     }: {
       psbt: Psbt;
       txHex?: string;
       txId?: string;
       value?: number;
       vout: number;
-      rbf?: boolean;
     }) {
       if (txHex === undefined) {
         console.warn(`Warning: missing txHex may allow fee attacks`);
@@ -1248,8 +1265,7 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
         scriptPubKey: this.getScriptPubKey(),
         isSegwit,
         witnessScript: this.getWitnessScript(),
-        redeemScript: this.getRedeemScript(),
-        rbf
+        redeemScript: this.getRedeemScript()
       });
       const finalizer = ({
         psbt,
@@ -1295,23 +1311,16 @@ export function DescriptorsFactory(ecc: TinySecp256k1Interface) {
         scriptPubKey = out.script;
       }
       const locktime = this.getLockTime() || 0;
-      const sequence = this.getSequence();
-      //We don't know whether the user opted for RBF or not. So check that
-      //at least one of the 2 sequences matches.
-      const sequenceNoRBF =
-        sequence !== undefined
-          ? sequence
-          : locktime === 0
-            ? 0xffffffff
-            : 0xfffffffe;
-      const sequenceRBF = sequence !== undefined ? sequence : 0xfffffffd;
+      let sequence = this.getSequence();
+      if (sequence === undefined && locktime !== 0) sequence = 0xfffffffe;
+      if (sequence === undefined && locktime === 0) sequence = 0xffffffff;
       const eqBuffers = (buf1: Buffer | undefined, buf2: Buffer | undefined) =>
         buf1 instanceof Buffer && buf2 instanceof Buffer
           ? Buffer.compare(buf1, buf2) === 0
           : buf1 === buf2;
       if (
         Buffer.compare(scriptPubKey, this.getScriptPubKey()) !== 0 ||
-        (sequenceRBF !== inputSequence && sequenceNoRBF !== inputSequence) ||
+        sequence !== inputSequence ||
         locktime !== psbt.locktime ||
         !eqBuffers(this.getWitnessScript(), input.witnessScript) ||
         !eqBuffers(this.getRedeemScript(), input.redeemScript)
